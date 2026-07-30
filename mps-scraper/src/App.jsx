@@ -207,7 +207,7 @@ function App() {
     <main className="app">
       <section className="container">
         <header className="header">
-          <p className="eyebrow">MPS Production Tools</p>
+          <p className="eyebrow">Phos Production Tools</p>
 
           <h1>MPS Shortage Scraper</h1>
 
