@@ -3,30 +3,123 @@ import "./App.css";
 
 function cleanShortageItem(value) {
   return value
-    // Remove labels such as "Shortage -" and "Raw shortage -"
-    .replace(/\braw\s+shortages?\s*[-–:]?\s*/gi, "")
-    .replace(/\bshortages?\s*[-–:]?\s*/gi, "")
-
-    // Remove bracketed dates and notes
-    .replace(/\([^)]*\)/g, "")
+    // Remove surrounding quotation marks and spaces
+    .replace(/^["'\s]+|["'\s]+$/g, "")
 
     // Remove quantities such as X1, x14 or 52off
     .replace(/\s+[xX]\s*\d+\b/g, "")
     .replace(/\s+\d+\s*off\b/gi, "")
 
-    // Remove surrounding quotation marks and spaces
-    .replace(/^["'\s-]+|["'\s-]+$/g, "")
+    // Clean repeated spaces
     .replace(/\s+/g, " ")
     .trim();
 }
 
+function extractShortageCodes(comments) {
+  const normalised = comments
+    .replace(/\r?\n/g, " ")
+    .replace(/[“”"]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  /*
+    Remove dates and notes such as:
+    (TBC)
+    (05/08)
+    (Pre cut 03/08)
+    (52)
+    (REJECTS)
+  */
+  const withoutNotes = normalised.replace(/\([^)]*\)/g, " ");
+
+  /*
+    Remove shortage labels but preserve the actual component codes.
+
+    Handles:
+    Shortage -
+    Shortages -
+    Raw shortage -
+    Raw shortages -
+    RAW -
+  */
+  const withoutLabels = withoutNotes
+    .replace(/\braw\s+shortages?\s*[-–:]?\s*/gi, " ")
+    .replace(/\bshortages?\s*[-–:]?\s*/gi, " ")
+    .replace(/\braw\s*[-–:]\s*/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  /*
+    Add a comma where two component codes are separated only by spaces.
+
+    Example:
+    CEYP-DEEP-CORE-ALU CEYP-TFR-ALU
+
+    becomes:
+    CEYP-DEEP-CORE-ALU, CEYP-TFR-ALU
+  */
+  const separated = withoutLabels.replace(
+    /([A-Z0-9][A-Z0-9./-]*-[A-Z0-9./-]+)\s+(?=[A-Z0-9]+(?:-[A-Z0-9./]+)+\b)/g,
+    "$1, "
+  );
+
+  return separated
+    /*
+      Split on:
+      - commas
+      - slashes surrounded by spaces
+
+      This preserves internal slashes in codes such as:
+      TINF-MINI-B-350/700/1050-22DALI
+      TRA-9004/TRL-B
+    */
+    .split(/\s*,\s*|\s+\/\s+/)
+    .map(cleanShortageItem)
+    .filter((item) => {
+      if (!item) {
+        return false;
+      }
+
+      /*
+        Accept component-code-shaped values, plus intentional generic
+        shortages such as Track & Accs.
+      */
+      return (
+        /^[A-Z0-9]+(?:[-/][A-Z0-9.]+)+(?:\s+[A-Z0-9]+)?$/i.test(item) ||
+        /^tracks?\s*&\s*acc(?:s|es)$/i.test(item)
+      );
+    });
+}
+
+function buildRows(input) {
+  const rows = [];
+  const physicalLines = input.split(/\r?\n/);
+
+  physicalLines.forEach((line) => {
+    if (!line.trim()) {
+      return;
+    }
+
+    const columns = line.split("\t");
+    const possibleSalesOrder = String(columns[1] ?? "").trim();
+
+    /*
+      A normal Excel row has an eight-digit sales order in column 2.
+      Lines without one are treated as continuation lines from multiline cells.
+    */
+    if (/^\d{8}$/.test(possibleSalesOrder)) {
+      rows.push(line);
+    } else if (rows.length > 0) {
+      rows[rows.length - 1] += ` ${line.trim()}`;
+    }
+  });
+
+  return rows;
+}
+
 function parseShortages(input) {
   const shortageMap = new Map();
-
-  const rows = input
-    .split(/\r?\n/)
-    .map((row) => row.trimEnd())
-    .filter(Boolean);
+  const rows = buildRows(input);
 
   rows.forEach((row) => {
     const columns = row.split("\t");
@@ -34,50 +127,26 @@ function parseShortages(input) {
     const salesOrder = String(columns[1] ?? "").trim();
     const comments = String(columns[6] ?? "").trim();
 
-    // Ignore section headings and rows without a valid sales order
+    // Ignore rows without a valid sales order
     if (!/^\d{8}$/.test(salesOrder)) {
       return;
     }
 
-    // Only scrape rows explicitly mentioning shortage or shortages
-    if (!/\bshortages?\b/i.test(comments)) {
+    // Include normal shortages, raw shortages and raw entries
+    if (!/\b(?:raw|shortages?)\b/i.test(comments)) {
       return;
     }
 
-    /*
-      Split only on:
-      - commas
-      - slashes surrounded by spaces
+    const shortages = extractShortageCodes(comments);
 
-      This preserves slashes inside valid codes such as:
-      TINF-MINI-B-350/700/1050-22DALI
-      NF-27/65-...
-    */
-    const parts = comments
-      .replace(/\r?\n/g, " ")
-      .split(/\s+\/\s+|,/)
-      .map(cleanShortageItem)
-      .filter(Boolean);
+    shortages.forEach((shortage) => {
+      const normalisedShortage = shortage.toUpperCase();
 
-    parts.forEach((part) => {
-      // Ignore text left over before an embedded shortage label
-      const embeddedShortage = part.match(
-        /(?:raw\s+)?shortages?\s*[-–:]?\s*(.+)$/i
-      );
-
-      const shortage = cleanShortageItem(
-        embeddedShortage ? embeddedShortage[1] : part
-      );
-
-      if (!shortage) {
-        return;
+      if (!shortageMap.has(normalisedShortage)) {
+        shortageMap.set(normalisedShortage, new Set());
       }
 
-      if (!shortageMap.has(shortage)) {
-        shortageMap.set(shortage, new Set());
-      }
-
-      shortageMap.get(shortage).add(salesOrder);
+      shortageMap.get(normalisedShortage).add(salesOrder);
     });
   });
 
@@ -119,6 +188,7 @@ function App() {
     const parsedResults = parseShortages(input);
 
     setResults(parsedResults);
+
     setMessage(
       parsedResults.length
         ? `Found ${parsedResults.length} unique shortages.`
@@ -138,7 +208,9 @@ function App() {
       <section className="container">
         <header className="header">
           <p className="eyebrow">MPS Production Tools</p>
+
           <h1>MPS Shortage Scraper</h1>
+
           <p>
             Copy the rows from Excel, paste them below and group each shortage
             by sales order.
@@ -157,11 +229,19 @@ function App() {
           />
 
           <div className="actions">
-            <button type="button" className="primary" onClick={handleScrape}>
+            <button
+              type="button"
+              className="primary"
+              onClick={handleScrape}
+            >
               Scrape shortages
             </button>
 
-            <button type="button" className="secondary" onClick={handleClear}>
+            <button
+              type="button"
+              className="secondary"
+              onClick={handleClear}
+            >
               Clear
             </button>
           </div>
@@ -174,6 +254,7 @@ function App() {
             <div className="results-header">
               <div>
                 <h2>Shortage results</h2>
+
                 <p>{results.length} unique component codes</p>
               </div>
 
@@ -198,8 +279,12 @@ function App() {
                 <tbody>
                   {filteredResults.map((result) => (
                     <tr key={result.shortage}>
-                      <td className="shortage-code">{result.shortage}</td>
+                      <td className="shortage-code">
+                        {result.shortage}
+                      </td>
+
                       <td>{result.orders.join(", ")}</td>
+
                       <td>{result.orders.length}</td>
                     </tr>
                   ))}
@@ -208,7 +293,9 @@ function App() {
             </div>
 
             {filteredResults.length === 0 && (
-              <p className="empty-results">No matching results found.</p>
+              <p className="empty-results">
+                No matching results found.
+              </p>
             )}
           </section>
         )}
