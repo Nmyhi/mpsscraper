@@ -15,7 +15,34 @@ function cleanShortageItem(value) {
     .trim();
 }
 
-function extractShortageCodes(comments) {
+function extractDateFromText(value) {
+  const matches = [...value.matchAll(/\(([^)]*)\)/g)];
+
+  /*
+    Work backwards through bracketed notes so the nearest date is preferred.
+
+    Handles:
+    (04/08)
+    (Pre cut 04/08)
+    (Cust length 17/08)
+    (05/08/2026)
+  */
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const bracketText = matches[index][1];
+
+    const dateMatch = bracketText.match(
+      /\b(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b/
+    );
+
+    if (dateMatch) {
+      return dateMatch[1];
+    }
+  }
+
+  return "";
+}
+
+function extractShortageItems(comments) {
   const normalised = comments
     .replace(/\r?\n/g, " ")
     .replace(/[“”"]/g, " ")
@@ -23,70 +50,92 @@ function extractShortageCodes(comments) {
     .trim();
 
   /*
-    Remove dates and notes such as:
-    (TBC)
-    (05/08)
-    (Pre cut 03/08)
-    (52)
-    (REJECTS)
-  */
-  const withoutNotes = normalised.replace(/\([^)]*\)/g, " ");
+    Insert a comma before another Shortage or Raw Shortage label when the
+    spreadsheet contains several labelled sections without punctuation.
 
-  /*
-    Remove shortage labels but preserve the actual component codes.
-
-    Handles:
-    Shortage -
-    Shortages -
-    Raw shortage -
-    Raw shortages -
-    RAW -
+    Example:
+    ITEM-A (17/08) Shortage - ITEM-B (31/07)
   */
-  const withoutLabels = withoutNotes
-    .replace(/\braw\s+shortages?\s*[-–:]?\s*/gi, " ")
-    .replace(/\bshortages?\s*[-–:]?\s*/gi, " ")
-    .replace(/\braw\s*[-–:]\s*/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const separatedLabels = normalised
+    .replace(
+      /\)\s+(?=(?:raw\s+)?shortages?\s*[-–:])/gi,
+      "), "
+    )
+    .replace(
+      /\)\s+(?=raw\s*[-–:])/gi,
+      "), "
+    );
 
   /*
     Add a comma where two component codes are separated only by spaces.
 
     Example:
-    CEYP-DEEP-CORE-ALU CEYP-TFR-ALU
-
-    becomes:
-    CEYP-DEEP-CORE-ALU, CEYP-TFR-ALU
+    CEYP-DEEP-CORE-ALU (TBC) CEYP-TFR-ALU (05/08)
   */
-  const separated = withoutLabels.replace(
-    /([A-Z0-9][A-Z0-9./-]*-[A-Z0-9./-]+)\s+(?=[A-Z0-9]+(?:-[A-Z0-9./]+)+\b)/g,
+  const separatedCodes = separatedLabels.replace(
+    /(\([^)]*\)|[A-Z0-9./-]+)\s+(?=[A-Z0-9]+(?:-[A-Z0-9./]+)+\b)/g,
     "$1, "
   );
 
-  return separated
-    /*
-      Split on:
-      - commas
-      - slashes surrounded by spaces
+  /*
+    Split on:
+    - commas
+    - slashes surrounded by spaces
 
-      This preserves internal slashes in codes such as:
-      TINF-MINI-B-350/700/1050-22DALI
-      TRA-9004/TRL-B
-    */
-    .split(/\s*,\s*|\s+\/\s+/)
-    .map(cleanShortageItem)
-    .filter((item) => {
-      if (!item) {
+    Internal slashes remain intact:
+    TINF-MINI-B-350/700/1050-22DALI
+    TRA-9004/TRL-B
+  */
+  const rawItems = separatedCodes.split(/\s*,\s*|\s+\/\s+/);
+
+  let inheritedDate = "";
+
+  /*
+    Dates commonly appear only on the final component in a comma-separated
+    group. We process each group backwards so that date can be applied to all
+    shortages belonging to the same group.
+  */
+  return rawItems
+    .reverse()
+    .map((rawItem) => {
+      const explicitDate = extractDateFromText(rawItem);
+
+      if (explicitDate) {
+        inheritedDate = explicitDate;
+      }
+
+      const shortage = cleanShortageItem(
+        rawItem
+          // Remove labels
+          .replace(/\braw\s+shortages?\s*[-–:]?\s*/gi, "")
+          .replace(/\bshortages?\s*[-–:]?\s*/gi, "")
+          .replace(/\braw\s*[-–:]\s*/gi, "")
+
+          // Remove bracketed notes after extracting the date
+          .replace(/\([^)]*\)/g, "")
+      );
+
+      /*
+        A slash between groups resets the inherited date in the source data,
+        but the split has removed that delimiter. We therefore retain the
+        nearest date while processing backwards.
+      */
+      return {
+        shortage,
+        date: explicitDate || inheritedDate,
+      };
+    })
+    .reverse()
+    .filter(({ shortage }) => {
+      if (!shortage) {
         return false;
       }
 
-      /*
-        Accept component-code-shaped values, plus intentional generic
-        shortages such as Track & Accs.
-      */
       return (
-        /^[A-Z0-9]+(?:[-/][A-Z0-9.]+)+(?:\s+[A-Z0-9]+)?$/i.test(item) ||
-        /^tracks?\s*&\s*acc(?:s|es)$/i.test(item)
+        /^[A-Z0-9]+(?:[-/][A-Z0-9.]+)+(?:\s+[A-Z0-9]+)?$/i.test(
+          shortage
+        ) ||
+        /^tracks?\s*&\s*acc(?:s|es)$/i.test(shortage)
       );
     });
 }
@@ -105,7 +154,7 @@ function buildRows(input) {
 
     /*
       A normal Excel row has an eight-digit sales order in column 2.
-      Lines without one are treated as continuation lines from multiline cells.
+      Lines without one are continuation lines from multiline Excel cells.
     */
     if (/^\d{8}$/.test(possibleSalesOrder)) {
       rows.push(line);
@@ -119,6 +168,7 @@ function buildRows(input) {
 
 function parseShortages(input) {
   const shortageMap = new Map();
+  const datedItems = [];
   const rows = buildRows(input);
 
   rows.forEach((row) => {
@@ -127,40 +177,190 @@ function parseShortages(input) {
     const salesOrder = String(columns[1] ?? "").trim();
     const comments = String(columns[6] ?? "").trim();
 
-    // Ignore rows without a valid sales order
     if (!/^\d{8}$/.test(salesOrder)) {
       return;
     }
 
-    // Include normal shortages, raw shortages and raw entries
     if (!/\b(?:raw|shortages?)\b/i.test(comments)) {
       return;
     }
 
-    const shortages = extractShortageCodes(comments);
+    const shortageItems = extractShortageItems(comments);
 
-    shortages.forEach((shortage) => {
+    shortageItems.forEach(({ shortage, date }) => {
       const normalisedShortage = shortage.toUpperCase();
 
+      /*
+        Existing main shortage table.
+      */
       if (!shortageMap.has(normalisedShortage)) {
         shortageMap.set(normalisedShortage, new Set());
       }
 
       shortageMap.get(normalisedShortage).add(salesOrder);
+
+      /*
+        Separate dated list used by the current-week section.
+      */
+      if (date) {
+        datedItems.push({
+          shortage: normalisedShortage,
+          salesOrder,
+          date,
+        });
+      }
     });
   });
 
-  return Array.from(shortageMap.entries())
+  const shortages = Array.from(shortageMap.entries())
     .map(([shortage, orders]) => ({
       shortage,
       orders: Array.from(orders).sort(),
     }))
     .sort((a, b) => a.shortage.localeCompare(b.shortage));
+
+  return {
+    shortages,
+    datedItems,
+  };
+}
+
+function parseShortDate(dateText, referenceDate = new Date()) {
+  const parts = dateText.split("/").map(Number);
+
+  if (parts.length < 2 || parts.some(Number.isNaN)) {
+    return null;
+  }
+
+  const [day, month, suppliedYear] = parts;
+
+  let year = referenceDate.getFullYear();
+
+  if (suppliedYear) {
+    year =
+      suppliedYear < 100
+        ? 2000 + suppliedYear
+        : suppliedYear;
+  }
+
+  const parsedDate = new Date(year, month - 1, day);
+
+  if (
+    parsedDate.getFullYear() !== year ||
+    parsedDate.getMonth() !== month - 1 ||
+    parsedDate.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return parsedDate;
+}
+
+function getStartOfWeek(date) {
+  const result = new Date(date);
+  const day = result.getDay();
+
+  /*
+    Convert Sunday-based JavaScript weekdays into Monday-based weeks.
+  */
+  const difference = day === 0 ? -6 : 1 - day;
+
+  result.setDate(result.getDate() + difference);
+  result.setHours(0, 0, 0, 0);
+
+  return result;
+}
+
+function getEndOfWeek(date) {
+  const result = getStartOfWeek(date);
+
+  result.setDate(result.getDate() + 6);
+  result.setHours(23, 59, 59, 999);
+
+  return result;
+}
+
+function formatDisplayDate(date) {
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+  }).format(date);
+}
+
+function formatFullDisplayDate(date) {
+  return new Intl.DateTimeFormat("en-GB", {
+    weekday: "long",
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  }).format(date);
+}
+
+function buildCurrentWeekGroups(datedItems) {
+  const today = new Date();
+  const weekStart = getStartOfWeek(today);
+  const weekEnd = getEndOfWeek(today);
+
+  const dateMap = new Map();
+
+  datedItems.forEach(({ shortage, salesOrder, date }) => {
+    const parsedDate = parseShortDate(date, today);
+
+    if (!parsedDate) {
+      return;
+    }
+
+    if (parsedDate < weekStart || parsedDate > weekEnd) {
+      return;
+    }
+
+    const dateKey = [
+      parsedDate.getFullYear(),
+      String(parsedDate.getMonth() + 1).padStart(2, "0"),
+      String(parsedDate.getDate()).padStart(2, "0"),
+    ].join("-");
+
+    if (!dateMap.has(dateKey)) {
+      dateMap.set(dateKey, {
+        date: parsedDate,
+        shortages: new Map(),
+      });
+    }
+
+    const group = dateMap.get(dateKey);
+
+    if (!group.shortages.has(shortage)) {
+      group.shortages.set(shortage, new Set());
+    }
+
+    group.shortages.get(shortage).add(salesOrder);
+  });
+
+  return {
+    weekStart,
+    weekEnd,
+
+    groups: Array.from(dateMap.values())
+      .sort((a, b) => a.date - b.date)
+      .map((group) => ({
+        date: group.date,
+
+        shortages: Array.from(group.shortages.entries())
+          .map(([shortage, orders]) => ({
+            shortage,
+            orders: Array.from(orders).sort(),
+          }))
+          .sort((a, b) =>
+            a.shortage.localeCompare(b.shortage)
+          ),
+      })),
+  };
 }
 
 function App() {
   const [input, setInput] = useState("");
   const [results, setResults] = useState([]);
+  const [datedItems, setDatedItems] = useState([]);
   const [search, setSearch] = useState("");
   const [message, setMessage] = useState("");
 
@@ -174,24 +374,33 @@ function App() {
     return results.filter(
       (result) =>
         result.shortage.toLowerCase().includes(searchTerm) ||
-        result.orders.some((order) => order.includes(searchTerm))
+        result.orders.some((order) =>
+          order.includes(searchTerm)
+        )
     );
   }, [results, search]);
+
+  const currentWeek = useMemo(
+    () => buildCurrentWeekGroups(datedItems),
+    [datedItems]
+  );
 
   function handleScrape() {
     if (!input.trim()) {
       setResults([]);
+      setDatedItems([]);
       setMessage("Paste the Excel data before scraping.");
       return;
     }
 
-    const parsedResults = parseShortages(input);
+    const parsed = parseShortages(input);
 
-    setResults(parsedResults);
+    setResults(parsed.shortages);
+    setDatedItems(parsed.datedItems);
 
     setMessage(
-      parsedResults.length
-        ? `Found ${parsedResults.length} unique shortages.`
+      parsed.shortages.length
+        ? `Found ${parsed.shortages.length} unique shortages.`
         : "No shortage rows were found."
     );
   }
@@ -199,6 +408,7 @@ function App() {
   function handleClear() {
     setInput("");
     setResults([]);
+    setDatedItems([]);
     setSearch("");
     setMessage("");
   }
@@ -212,8 +422,8 @@ function App() {
           <h1>MPS Shortage Scraper</h1>
 
           <p>
-            Copy the rows from Excel, paste them below and group each shortage
-            by sales order.
+            Copy the rows from Excel, paste them below and group each
+            shortage by sales order.
           </p>
         </header>
 
@@ -223,7 +433,9 @@ function App() {
           <textarea
             id="excel-data"
             value={input}
-            onChange={(event) => setInput(event.target.value)}
+            onChange={(event) =>
+              setInput(event.target.value)
+            }
             placeholder="Copy the required rows from Excel and paste them here..."
             spellCheck="false"
           />
@@ -246,58 +458,137 @@ function App() {
             </button>
           </div>
 
-          {message && <p className="message">{message}</p>}
+          {message && (
+            <p className="message">{message}</p>
+          )}
         </section>
 
         {results.length > 0 && (
-          <section className="panel results-panel">
-            <div className="results-header">
-              <div>
-                <h2>Shortage results</h2>
+          <>
+            <section className="panel weekly-panel">
+              <div className="weekly-header">
+                <div>
+                  <p className="eyebrow">
+                    Current production week
+                  </p>
 
-                <p>{results.length} unique component codes</p>
+                  <h2>Shortages dated for this week</h2>
+
+                  <p>
+                    {formatFullDisplayDate(
+                      currentWeek.weekStart
+                    )}{" "}
+                    to{" "}
+                    {formatFullDisplayDate(
+                      currentWeek.weekEnd
+                    )}
+                  </p>
+                </div>
               </div>
 
-              <input
-                type="search"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search shortage or SO..."
-              />
-            </div>
+              {currentWeek.groups.length > 0 ? (
+                <div className="weekly-groups">
+                  {currentWeek.groups.map((group) => (
+                    <article
+                      className="weekly-date-group"
+                      key={group.date.toISOString()}
+                    >
+                      <div className="weekly-date">
+                        <span>
+                          {formatDisplayDate(group.date)}
+                        </span>
 
-            <div className="table-wrapper">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Shortage</th>
-                    <th>Sales orders</th>
-                    <th>Order count</th>
-                  </tr>
-                </thead>
+                        <small>
+                          {new Intl.DateTimeFormat("en-GB", {
+                            weekday: "long",
+                          }).format(group.date)}
+                        </small>
+                      </div>
 
-                <tbody>
-                  {filteredResults.map((result) => (
-                    <tr key={result.shortage}>
-                      <td className="shortage-code">
-                        {result.shortage}
-                      </td>
+                      <div className="weekly-shortages">
+                        {group.shortages.map((item) => (
+                          <div
+                            className="weekly-shortage-row"
+                            key={item.shortage}
+                          >
+                            <span className="shortage-code">
+                              {item.shortage}
+                            </span>
 
-                      <td>{result.orders.join(", ")}</td>
-
-                      <td>{result.orders.length}</td>
-                    </tr>
+                            <span className="weekly-orders">
+                              {item.orders.join(", ")}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </article>
                   ))}
-                </tbody>
-              </table>
-            </div>
+                </div>
+              ) : (
+                <p className="empty-week">
+                  No shortages are dated for the current
+                  week.
+                </p>
+              )}
+            </section>
 
-            {filteredResults.length === 0 && (
-              <p className="empty-results">
-                No matching results found.
-              </p>
-            )}
-          </section>
+            <section className="panel results-panel">
+              <div className="results-header">
+                <div>
+                  <h2>All shortage results</h2>
+
+                  <p>
+                    {results.length} unique component codes
+                  </p>
+                </div>
+
+                <input
+                  type="search"
+                  value={search}
+                  onChange={(event) =>
+                    setSearch(event.target.value)
+                  }
+                  placeholder="Search shortage or SO..."
+                />
+              </div>
+
+              <div className="table-wrapper">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Shortage</th>
+                      <th>Sales orders</th>
+                      <th>Order count</th>
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    {filteredResults.map((result) => (
+                      <tr key={result.shortage}>
+                        <td className="shortage-code">
+                          {result.shortage}
+                        </td>
+
+                        <td>
+                          {result.orders.join(", ")}
+                        </td>
+
+                        <td>
+                          {result.orders.length}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {filteredResults.length === 0 && (
+                <p className="empty-results">
+                  No matching results found.
+                </p>
+              )}
+            </section>
+          </>
         )}
       </section>
     </main>
