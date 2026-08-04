@@ -50,94 +50,98 @@ function extractShortageItems(comments) {
     .trim();
 
   /*
-    Insert a comma before another Shortage or Raw Shortage label when the
-    spreadsheet contains several labelled sections without punctuation.
+    Separate repeated shortage labels.
 
     Example:
-    ITEM-A (17/08) Shortage - ITEM-B (31/07)
+    ITEM-A (TBC) Shortage - ITEM-B (05/08)
   */
   const separatedLabels = normalised
     .replace(
       /\)\s+(?=(?:raw\s+)?shortages?\s*[-–:])/gi,
-      "), "
+      ") / "
     )
-    .replace(
-      /\)\s+(?=raw\s*[-–:])/gi,
-      "), "
+    .replace(/\)\s+(?=raw\s*[-–:])/gi, ") / ");
+
+  /*
+    First split into shortage groups using spaced slashes.
+
+    Internal slashes remain untouched:
+    TINF-MINI-B-350/700/1050-22DALI
+  */
+  const groups = separatedLabels.split(/\s+\/\s+/);
+
+  const extractedItems = [];
+
+  groups.forEach((group) => {
+    /*
+      Add commas where two component codes have only spaces between them.
+
+      Example:
+      CEYP-DEEP-CORE-ALU (TBC) CEYP-TFR-ALU (05/08)
+    */
+    const separatedCodes = group.replace(
+      /(\([^)]*\)|[A-Z0-9./-]+)\s+(?=[A-Z0-9]+(?:-[A-Z0-9./]+)+\b)/g,
+      "$1, "
     );
 
-  /*
-    Add a comma where two component codes are separated only by spaces.
+    const rawItems = separatedCodes.split(/\s*,\s*/);
 
-    Example:
-    CEYP-DEEP-CORE-ALU (TBC) CEYP-TFR-ALU (05/08)
-  */
-  const separatedCodes = separatedLabels.replace(
-    /(\([^)]*\)|[A-Z0-9./-]+)\s+(?=[A-Z0-9]+(?:-[A-Z0-9./]+)+\b)/g,
-    "$1, "
-  );
+    let inheritedDate = "";
+    let inheritedTbc = false;
 
-  /*
-    Split on:
-    - commas
-    - slashes surrounded by spaces
+    /*
+      Excel commonly puts one bracketed status at the end of several
+      comma-separated component codes:
 
-    Internal slashes remain intact:
-    TINF-MINI-B-350/700/1050-22DALI
-    TRA-9004/TRL-B
-  */
-  const rawItems = separatedCodes.split(/\s*,\s*|\s+\/\s+/);
+      ITEM-A, ITEM-B, ITEM-C (TBC)
 
-  let inheritedDate = "";
+      Process backwards so all three inherit TBC.
+    */
+    const groupItems = rawItems
+      .reverse()
+      .map((rawItem) => {
+        const date = extractDateFromText(rawItem);
+        const hasTbc = /\(\s*TBC\s*\)/i.test(rawItem);
 
-  /*
-    Dates commonly appear only on the final component in a comma-separated
-    group. We process each group backwards so that date can be applied to all
-    shortages belonging to the same group.
-  */
-  return rawItems
-    .reverse()
-    .map((rawItem) => {
-      const explicitDate = extractDateFromText(rawItem);
+        if (date) {
+          inheritedDate = date;
+        }
 
-      if (explicitDate) {
-        inheritedDate = explicitDate;
-      }
+        if (hasTbc) {
+          inheritedTbc = true;
+        }
 
-      const shortage = cleanShortageItem(
-        rawItem
-          // Remove labels
-          .replace(/\braw\s+shortages?\s*[-–:]?\s*/gi, "")
-          .replace(/\bshortages?\s*[-–:]?\s*/gi, "")
-          .replace(/\braw\s*[-–:]\s*/gi, "")
+        const shortage = cleanShortageItem(
+          rawItem
+            .replace(/\braw\s+shortages?\s*[-–:]?\s*/gi, "")
+            .replace(/\bshortages?\s*[-–:]?\s*/gi, "")
+            .replace(/\braw\s*[-–:]\s*/gi, "")
+            .replace(/\([^)]*\)/g, "")
+        );
 
-          // Remove bracketed notes after extracting the date
-          .replace(/\([^)]*\)/g, "")
-      );
+        return {
+          shortage,
+          date: date || inheritedDate,
+          isTbc: hasTbc || inheritedTbc,
+        };
+      })
+      .reverse();
 
-      /*
-        A slash between groups resets the inherited date in the source data,
-        but the split has removed that delimiter. We therefore retain the
-        nearest date while processing backwards.
-      */
-      return {
-        shortage,
-        date: explicitDate || inheritedDate,
-      };
-    })
-    .reverse()
-    .filter(({ shortage }) => {
-      if (!shortage) {
-        return false;
-      }
+    extractedItems.push(...groupItems);
+  });
 
-      return (
-        /^[A-Z0-9]+(?:[-/][A-Z0-9.]+)+(?:\s+[A-Z0-9]+)?$/i.test(
-          shortage
-        ) ||
-        /^tracks?\s*&\s*acc(?:s|es)$/i.test(shortage)
-      );
-    });
+  return extractedItems.filter(({ shortage }) => {
+    if (!shortage) {
+      return false;
+    }
+
+    return (
+      /^[A-Z0-9]+(?:[-/][A-Z0-9.]+)+(?:\s+[A-Z0-9]+)?$/i.test(
+        shortage
+      ) ||
+      /^tracks?\s*&\s*acc(?:s|es)$/i.test(shortage)
+    );
+  });
 }
 
 function buildRows(input) {
@@ -168,8 +172,9 @@ function buildRows(input) {
 
 function parseShortages(input) {
   const shortageMap = new Map();
+  const tbcMap = new Map();
   const datedItems = [];
-  const rows = buildRows(input);
+  const rows = buildRows(input);;
 
   rows.forEach((row) => {
     const columns = row.split("\t");
@@ -187,29 +192,40 @@ function parseShortages(input) {
 
     const shortageItems = extractShortageItems(comments);
 
-    shortageItems.forEach(({ shortage, date }) => {
-      const normalisedShortage = shortage.toUpperCase();
+    shortageItems.forEach(({ shortage, date, isTbc }) => {
+  const normalisedShortage = shortage.toUpperCase();
 
-      /*
-        Existing main shortage table.
-      */
-      if (!shortageMap.has(normalisedShortage)) {
-        shortageMap.set(normalisedShortage, new Set());
-      }
+  /*
+    Main shortage results.
+  */
+  if (!shortageMap.has(normalisedShortage)) {
+    shortageMap.set(normalisedShortage, new Set());
+  }
 
-      shortageMap.get(normalisedShortage).add(salesOrder);
+  shortageMap.get(normalisedShortage).add(salesOrder);
 
-      /*
-        Separate dated list used by the current-week section.
-      */
-      if (date) {
-        datedItems.push({
-          shortage: normalisedShortage,
-          salesOrder,
-          date,
-        });
-      }
+  /*
+    Current-week dated results.
+  */
+  if (date) {
+    datedItems.push({
+      shortage: normalisedShortage,
+      salesOrder,
+      date,
     });
+  }
+
+  /*
+    Separate TBC section.
+  */
+  if (isTbc) {
+    if (!tbcMap.has(normalisedShortage)) {
+      tbcMap.set(normalisedShortage, new Set());
+    }
+
+    tbcMap.get(normalisedShortage).add(salesOrder);
+  }
+});
   });
 
   const shortages = Array.from(shortageMap.entries())
@@ -219,10 +235,18 @@ function parseShortages(input) {
     }))
     .sort((a, b) => a.shortage.localeCompare(b.shortage));
 
+    const tbcShortages = Array.from(tbcMap.entries())
+  .map(([shortage, orders]) => ({
+    shortage,
+    orders: Array.from(orders).sort(),
+  }))
+  .sort((a, b) => a.shortage.localeCompare(b.shortage));
+
   return {
-    shortages,
-    datedItems,
-  };
+  shortages,
+  datedItems,
+  tbcShortages,
+};
 }
 
 function parseShortDate(dateText, referenceDate = new Date()) {
@@ -358,6 +382,7 @@ function buildCurrentWeekGroups(datedItems) {
 }
 
 function App() {
+  const [tbcShortages, setTbcShortages] = useState([]);
   const [input, setInput] = useState("");
   const [results, setResults] = useState([]);
   const [datedItems, setDatedItems] = useState([]);
@@ -397,6 +422,7 @@ function App() {
 
     setResults(parsed.shortages);
     setDatedItems(parsed.datedItems);
+    setTbcShortages(parsed.tbcShortages);
 
     setMessage(
       parsed.shortages.length
@@ -409,6 +435,7 @@ function App() {
     setInput("");
     setResults([]);
     setDatedItems([]);
+    setTbcShortages([]);
     setSearch("");
     setMessage("");
   }
@@ -528,6 +555,42 @@ function App() {
                 <p className="empty-week">
                   No shortages are dated for the current
                   week.
+                </p>
+              )}
+            </section>
+            
+              <section className="panel tbc-panel">
+              <div className="tbc-header">
+                <div>
+                  <p className="eyebrow">Awaiting confirmation</p>
+
+                  <h2>TBC shortages</h2>
+
+                  <p>
+                    {tbcShortages.length} component
+                    {tbcShortages.length === 1 ? "" : "s"} currently marked
+                    as TBC
+                  </p>
+                </div>
+              </div>
+
+              {tbcShortages.length > 0 ? (
+                <div className="tbc-list">
+                  {tbcShortages.map((item) => (
+                    <div className="tbc-row" key={item.shortage}>
+                      <span className="shortage-code">
+                        {item.shortage}
+                      </span>
+
+                      <span className="tbc-orders">
+                        {item.orders.join(", ")}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="empty-tbc">
+                  No shortages are currently marked as TBC.
                 </p>
               )}
             </section>
